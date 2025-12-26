@@ -10,6 +10,10 @@ import { saveAs } from "file-saver";
  *   -> previewMaxR/previewMaxC로 표시범위 조절 + "사용영역 전체" 버튼 제공
  * - sheet_to_json이 trailing blank를 잘라먹는 문제 해결
  *   -> ws["!ref"] 범위 기준으로 셀을 직접 읽어 2D grid 생성
+ *
+ * ✅ 추가 기능(이번 변경)
+ * - 좌/우 패널 폭을 드래그로 조절(Resizer)
+ * - 조절한 폭을 localStorage에 저장해서 새로고침해도 유지
  */
 
 // ====== localStorage ======
@@ -33,6 +37,7 @@ function saveState() {
     fileNameField,
     previewMaxR,
     previewMaxC,
+    splitLeftPx, // ✅ 추가
   };
   localStorage.setItem(LS_KEY, JSON.stringify(state));
 }
@@ -46,9 +51,9 @@ let selectedCellAddr = "";
 
 // 프리뷰
 let previewGrid = [];
-let previewMerges = [];      // ws["!merges"]
-let previewColWidths = [];   // ws["!cols"]
-let previewRowHeights = [];  // ws["!rows"]
+let previewMerges = []; // ws["!merges"]
+let previewColWidths = []; // ws["!cols"]
+let previewRowHeights = []; // ws["!rows"]
 
 // ✅ 표시 범위(기본값 넉넉하게)
 let previewMaxR = 120;
@@ -56,6 +61,9 @@ let previewMaxC = 40;
 
 // ✅ 현재 시트의 실제 사용 영역(!ref) 정보
 let currentSheetRange = { rows: 0, cols: 0 };
+
+// ✅ 좌/우 패널 분할 폭(px). 0이면 기본(fr) 비율 사용
+let splitLeftPx = 0;
 
 // GLOBAL: { [sheetName]: { [addr]: value } }
 let globalEdits = {};
@@ -82,6 +90,7 @@ if (persisted) {
   fileNameField = persisted.fileNameField ?? fileNameField;
   previewMaxR = persisted.previewMaxR ?? previewMaxR;
   previewMaxC = persisted.previewMaxC ?? previewMaxC;
+  splitLeftPx = persisted.splitLeftPx ?? splitLeftPx; // ✅ 추가
 }
 
 // ====== utils ======
@@ -120,7 +129,9 @@ function flattenGlobals() {
       out.push({ sheet, addr, value });
     }
   }
-  out.sort((a, b) => (a.sheet !== b.sheet ? a.sheet.localeCompare(b.sheet) : a.addr.localeCompare(b.addr)));
+  out.sort((a, b) =>
+    a.sheet !== b.sheet ? a.sheet.localeCompare(b.sheet) : a.addr.localeCompare(b.addr)
+  );
   return out;
 }
 
@@ -153,7 +164,10 @@ function renderGrid(grid2d, merges = [], cols = [], rows = []) {
   }
 
   const maxR = Math.min(previewMaxR, grid2d.length);
-  const maxC = Math.min(previewMaxC, Math.max(...grid2d.slice(0, maxR).map((r) => r.length || 0), 1));
+  const maxC = Math.min(
+    previewMaxC,
+    Math.max(...grid2d.slice(0, maxR).map((r) => r.length || 0), 1)
+  );
 
   // ---- merge maps ----
   const mergeStart = new Map();
@@ -275,7 +289,9 @@ function renderVariableFields() {
           <div style="display:flex; justify-content:space-between; gap:8px; align-items:flex-start;">
             <div>
               <div style="font-weight:700;">${escapeHtml(key)}</div>
-              <div style="color:#666; font-size:12px; margin-top:2px;">매핑: ${escapeHtml(mapText || "(없음)")}</div>
+              <div style="color:#666; font-size:12px; margin-top:2px;">매핑: ${escapeHtml(
+                mapText || "(없음)"
+              )}</div>
               <div style="color:#666; font-size:12px; margin-top:2px;">값 개수: ${vals.length}개</div>
             </div>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
@@ -285,7 +301,9 @@ function renderVariableFields() {
           </div>
 
           <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-            <input data-addinput="${escapeHtml(key)}" placeholder="${escapeHtml(key)} 값 추가 (예: P-101)" style="flex:1; min-width:180px;" />
+            <input data-addinput="${escapeHtml(
+              key
+            )}" placeholder="${escapeHtml(key)} 값 추가 (예: P-101)" style="flex:1; min-width:180px;" />
             <button data-addbtn="${escapeHtml(key)}">추가</button>
           </div>
 
@@ -330,7 +348,9 @@ function render() {
                     ${escapeHtml(g.value)}
                   </td>
                   <td style="padding:8px; border-bottom:1px solid #f2f2f2;">
-                    <button data-delglobal-sheet="${escapeHtml(g.sheet)}" data-delglobal-addr="${escapeHtml(g.addr)}">삭제</button>
+                    <button data-delglobal-sheet="${escapeHtml(
+                      g.sheet
+                    )}" data-delglobal-addr="${escapeHtml(g.addr)}">삭제</button>
                   </td>
                 </tr>
               `
@@ -341,20 +361,32 @@ function render() {
         </div>
       `;
 
+  // ✅ split 설정: px(사용자 조절)이 있으면 px 우선, 없으면 기존 fr 비율 사용
+  const leftWidthStyle = splitLeftPx
+    ? `grid-template-columns: ${splitLeftPx}px 10px 1fr;`
+    : `grid-template-columns: 1.6fr 10px 1fr;`;
+
   app.innerHTML = `
   <div style="padding:16px; font-family:system-ui;">
     <h1 style="margin:0 0 12px 0;">Excel Datasheet Generator (ZIP)</h1>
 
-    <div style="display:grid; grid-template-columns: 1.6fr 1fr; gap:16px;">
+    <div id="splitGrid" style="display:grid; ${leftWidthStyle} gap:16px; align-items:stretch;">
       <!-- LEFT -->
-      <div style="border:1px solid #ddd; border-radius:12px; padding:12px;">
+      <div id="leftPane" style="border:1px solid #ddd; border-radius:12px; padding:12px; min-width:320px; overflow:hidden;">
         <h2 style="margin:0 0 8px 0;">1) 템플릿 업로드 & 시트 선택</h2>
         <input id="fileInput" type="file" accept=".xlsx" />
 
         <div style="margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
           <label>Sheet:</label>
           <select id="sheetSelect" ${sheetNames.length ? "" : "disabled"}>
-            ${sheetNames.map(n => `<option value="${escapeHtml(n)}" ${n === selectedSheetName ? "selected" : ""}>${escapeHtml(n)}</option>`).join("")}
+            ${sheetNames
+              .map(
+                (n) =>
+                  `<option value="${escapeHtml(n)}" ${
+                    n === selectedSheetName ? "selected" : ""
+                  }>${escapeHtml(n)}</option>`
+              )
+              .join("")}
           </select>
           <button id="loadSheetBtn" ${selectedSheetName ? "" : "disabled"}>시트 로드</button>
         </div>
@@ -365,7 +397,9 @@ function render() {
           <label>행 <input id="maxRInput" type="number" min="10" max="2000" value="${previewMaxR}" style="width:90px;"></label>
           <label>열 <input id="maxCInput" type="number" min="5" max="500" value="${previewMaxC}" style="width:90px;"></label>
           <button id="applyPreviewRangeBtn">적용</button>
-          <button id="fitUsedRangeBtn" ${currentSheetRange.rows ? "" : "disabled"} title="ws['!ref'] 사용영역 전체로 맞춤">
+          <button id="fitUsedRangeBtn" ${
+            currentSheetRange.rows ? "" : "disabled"
+          } title="ws['!ref'] 사용영역 전체로 맞춤">
             사용영역 전체 (${currentSheetRange.rows || 0}x${currentSheetRange.cols || 0})
           </button>
           <span style="color:#666;">오른쪽/아래 안 보이면 행/열을 늘리세요.</span>
@@ -376,8 +410,14 @@ function render() {
         </div>
       </div>
 
+      <!-- RESIZER -->
+      <div id="resizer"
+           title="드래그해서 좌우 폭 조절"
+           style="cursor:col-resize; border-radius:8px; background:#f0f0f0; border:1px solid #e0e0e0;">
+      </div>
+
       <!-- RIGHT -->
-      <div style="border:1px solid #ddd; border-radius:12px; padding:12px;">
+      <div id="rightPane" style="border:1px solid #ddd; border-radius:12px; padding:12px; min-width:320px;">
         <h2 style="margin:0 0 8px 0;">2) 셀 편집 등록</h2>
 
         <div style="padding:10px; border:1px solid #eee; border-radius:10px; background:#fafafa;">
@@ -390,8 +430,12 @@ function render() {
             <div style="font-weight:700; margin-bottom:6px;">GLOBAL</div>
             <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
               <input id="globalValueInput" placeholder="공통 문구 입력" style="flex:1; min-width:200px;" />
-              <button id="applyGlobalBtn" ${selectedSheetName && selectedCellAddr ? "" : "disabled"}>GLOBAL 등록</button>
-              <button id="removeGlobalBtn" ${selectedSheetName && selectedCellAddr ? "" : "disabled"}>GLOBAL 해제</button>
+              <button id="applyGlobalBtn" ${
+                selectedSheetName && selectedCellAddr ? "" : "disabled"
+              }>GLOBAL 등록</button>
+              <button id="removeGlobalBtn" ${
+                selectedSheetName && selectedCellAddr ? "" : "disabled"
+              }>GLOBAL 해제</button>
             </div>
           </div>
 
@@ -399,8 +443,12 @@ function render() {
             <div style="font-weight:700; margin-bottom:6px;">VARIABLE</div>
             <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
               <input id="fieldKeyInput" placeholder="변수 필드명 (예: ItemNo)" style="flex:1; min-width:200px;" />
-              <button id="applyVariableBtn" ${selectedSheetName && selectedCellAddr ? "" : "disabled"}>VARIABLE 등록</button>
-              <button id="removeVariableBtn" ${selectedSheetName && selectedCellAddr ? "" : "disabled"}>VARIABLE 해제</button>
+              <button id="applyVariableBtn" ${
+                selectedSheetName && selectedCellAddr ? "" : "disabled"
+              }>VARIABLE 등록</button>
+              <button id="removeVariableBtn" ${
+                selectedSheetName && selectedCellAddr ? "" : "disabled"
+              }>VARIABLE 해제</button>
             </div>
           </div>
         </div>
@@ -432,8 +480,17 @@ function render() {
             <select id="fileNameFieldSelect">
               ${
                 Object.keys(variableMappings).length
-                  ? Object.keys(variableMappings).map(k => `<option value="${escapeHtml(k)}" ${k === fileNameField ? "selected" : ""}>${escapeHtml(k)}</option>`).join("")
-                  : `<option value="${escapeHtml(fileNameField)}">${escapeHtml(fileNameField)}</option>`
+                  ? Object.keys(variableMappings)
+                      .map(
+                        (k) =>
+                          `<option value="${escapeHtml(k)}" ${
+                            k === fileNameField ? "selected" : ""
+                          }>${escapeHtml(k)}</option>`
+                      )
+                      .join("")
+                  : `<option value="${escapeHtml(fileNameField)}">${escapeHtml(
+                      fileNameField
+                    )}</option>`
               }
             </select>
             <span style="color:#666; font-size:12px;">(이 필드 값 개수 = 생성 파일 개수)</span>
@@ -448,7 +505,9 @@ function render() {
 
           <details style="margin-top:8px;">
             <summary style="cursor:pointer;">파일명 미리보기(최대 10개)</summary>
-            <pre style="background:#fff; border:1px solid #eee; padding:8px; border-radius:10px; max-height:160px; overflow:auto;">${escapeHtml(filePreview)}</pre>
+            <pre style="background:#fff; border:1px solid #eee; padding:8px; border-radius:10px; max-height:160px; overflow:auto;">${escapeHtml(
+              filePreview
+            )}</pre>
           </details>
 
           <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
@@ -595,6 +654,51 @@ function render() {
 
   document.querySelector("#generateZipBtn")?.addEventListener("click", onGenerateZip);
 
+  // ✅ 좌우 패널 리사이즈(드래그)
+  (function bindResizer() {
+    const resizer = document.querySelector("#resizer");
+    const splitGrid = document.querySelector("#splitGrid");
+    if (!resizer || !splitGrid) return;
+
+    let dragging = false;
+
+    const onMove = (e) => {
+      if (!dragging) return;
+
+      const rect = splitGrid.getBoundingClientRect();
+      let newLeft = e.clientX - rect.left;
+
+      // 최소/최대 폭 제한 (오른쪽도 최소 보장)
+      const MIN_LEFT = 320;
+      const MIN_RIGHT = 320;
+      const maxLeft = rect.width - MIN_RIGHT - 10; // resizer width
+
+      newLeft = Math.max(MIN_LEFT, Math.min(maxLeft, newLeft));
+
+      splitLeftPx = Math.round(newLeft);
+      saveState();
+
+      // 즉시 반영
+      splitGrid.style.gridTemplateColumns = `${splitLeftPx}px 10px 1fr`;
+    };
+
+    const stop = () => {
+      dragging = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", stop);
+    };
+
+    resizer.addEventListener("mousedown", () => {
+      dragging = true;
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", stop);
+    });
+  })();
+
   document.querySelector("#resetAllBtn")?.addEventListener("click", () => {
     if (!confirm("정말 전체 초기화할까요? (저장된 값도 삭제됨)")) return;
     globalEdits = {};
@@ -612,6 +716,7 @@ function render() {
     previewColWidths = [];
     previewRowHeights = [];
     currentSheetRange = { rows: 0, cols: 0 };
+    splitLeftPx = 0; // ✅ 추가: 분할 폭도 초기화
     localStorage.removeItem(LS_KEY);
     render();
   });
@@ -673,7 +778,8 @@ function onRemoveGlobal() {
   if (!selectedSheetName || !selectedCellAddr) return;
   if (globalEdits[selectedSheetName]) {
     delete globalEdits[selectedSheetName][selectedCellAddr];
-    if (Object.keys(globalEdits[selectedSheetName]).length === 0) delete globalEdits[selectedSheetName];
+    if (Object.keys(globalEdits[selectedSheetName]).length === 0)
+      delete globalEdits[selectedSheetName];
   }
   saveState();
   render();
@@ -686,7 +792,9 @@ function onApplyVariable() {
 
   ensureField(key);
 
-  const exists = variableMappings[key].some((m) => m.sheetName === selectedSheetName && m.addr === selectedCellAddr);
+  const exists = variableMappings[key].some(
+    (m) => m.sheetName === selectedSheetName && m.addr === selectedCellAddr
+  );
   if (!exists) variableMappings[key].push({ sheetName: selectedSheetName, addr: selectedCellAddr });
 
   if (!variableMappings[fileNameField]) fileNameField = key;
@@ -701,7 +809,9 @@ function onRemoveVariable() {
   let removedAny = false;
   for (const [key, arr] of Object.entries(variableMappings)) {
     const before = arr.length;
-    variableMappings[key] = arr.filter((m) => !(m.sheetName === selectedSheetName && m.addr === selectedCellAddr));
+    variableMappings[key] = arr.filter(
+      (m) => !(m.sheetName === selectedSheetName && m.addr === selectedCellAddr)
+    );
     if (variableMappings[key].length !== before) removedAny = true;
     if (variableMappings[key].length === 0) {
       delete variableMappings[key];
@@ -745,7 +855,9 @@ async function onGenerateZip() {
 
     if (!variableMappings[fileNameField] || (variableValues[fileNameField] || []).length === 0) {
       return alert(
-        `파일명 필드(${fileNameField})에 값이 1개 이상 필요해요.\n현재 ${fileNameField} 값 개수: ${(variableValues[fileNameField] || []).length}`
+        `파일명 필드(${fileNameField})에 값이 1개 이상 필요해요.\n현재 ${fileNameField} 값 개수: ${
+          (variableValues[fileNameField] || []).length
+        }`
       );
     }
 
@@ -753,11 +865,14 @@ async function onGenerateZip() {
     alert(`파일 생성 개수: ${values.length}개 (ZIP 생성 중...)`);
 
     const zip = new JSZip();
-    const zipName = sanitizeFileName(`${fileNamePrefix}${fileNameSuffix || ""}_OUTPUT.zip`) || "output.zip";
+    const zipName =
+      sanitizeFileName(`${fileNamePrefix}${fileNameSuffix || ""}_OUTPUT.zip`) || "output.zip";
 
     for (let i = 0; i < values.length; i++) {
       const core = (values[i] ?? "").trim();
-      const baseName = `${fileNamePrefix}${core || `DS_${String(i + 1).padStart(3, "0")}`}${fileNameSuffix}.xlsx`;
+      const baseName = `${fileNamePrefix}${core || `DS_${String(i + 1).padStart(3, "0")}`}${
+        fileNameSuffix
+      }.xlsx`;
       const fileName = sanitizeFileName(baseName);
 
       const buf = await buildOneFileXlsx(i);
